@@ -1,32 +1,46 @@
+# Generate key pair to use on localhost
+
 - hosts: localhost
   connection: local
+
   tasks:
-  - name: "generate key pair"
+  - name: "Generate key pair"
     openssh_keypair:
       path: ~/.ssh/ansible_id_rsa
       state: present
-  - name: "create key pair using key_material obtained using 'file' lookup plugin"
+
+# Adding key to aws named 'CloudFormationKeyPair'
+  - name: "Create key pair using key_material obtained using 'file' lookup plugin"
     ec2_key:
       name: CloudFormationKeyPair
       key_material: "{{ lookup('file', '~/.ssh/ansible_id_rsa.pub') }}"
       state: present
-  - name: "create a simple stack"
+
+
+  - name: "Create a simple stack"
     cloudformation:
       state: present
       stack_name: test-stack
       region: eu-west-2
-      template: stack.yaml
+      template: instance.yaml
+
   - cloudformation_info:
       stack_name: test-stack
       stack_resources: true
     register: output
+
   - ec2_instance_info:
       instance_ids: "{{ output['cloudformation']['test-stack']['stack_resource_list'] | json_query(query) }}"
     vars:
       query: "[?ResourceType=='AWS::EC2::Instance'].PhysicalResourceId"
     register: ec2
+
   - set_fact:
       ec2_instances: "{{ ec2['instances'] | map(attribute='public_dns_name') | list }}"
+
+  - set_fact:
+      ec2_instance_id: "{{ ec2['instances'] | map(attribute='instance_id') | list }}"
+
   - name: "build inventory"
     add_host:
       name: "{{ item }}"
@@ -34,36 +48,128 @@
       ansible_ssh_private_key_file: ~/.ssh/ansible_id_rsa
       ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=60'
     with_items: "{{ ec2_instances }}"
+
+# Install all dependencies in the newly created instance
+
 - hosts: all
   become: true
   gather_facts: no
   tasks:
+  
   - name: "Wait for system to become reachable"
     wait_for_connection:
+  
   - name: "Gather facts for first time"
     setup:
-  - name: "Install Dependencies"
+
+  - name: Install required system packages
     apt:
-      name:
-      - nginx
-      - git
+      name: "{{ item }}"
       state: latest
-      update_cache: true
-  - name: "nginx configuration"
-    copy:
-      src: ./nginx.conf
-      dest: /etc/nginx/nginx.conf
-      owner: root
-      group: root
-      mode: 0644
-    register: nginx_config
-  - name: "reload nginx"
-    service:
-      name: nginx
-      state: reloaded
-    when: nginx_config.changed
-  - name: "static website"
+      update_cache: yes
+    loop: ['git','python-pip','apt-transport-https', 'ca-certificates', 'curl', 'gnupg-agent', 'software-properties-common', 'python3-pip']
+
+# Installing Docker
+
+  - name: Getting Docker GPG Key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Adding Docker repository
+    apt_repository:
+      repo: deb https://download.docker.com/linux/ubuntu bionic stable
+      state: present
+      update_cache: yes
+
+  - name: Installing Docker
+    apt:
+      name: "{{ item }}"
+      state: latest
+    loop: ['docker-ce','docker-ce-cli','containerd.io']
+
+  - name: Install jsondiff (required for stack deply)
+    pip:
+      name: jsondiff
+
+# Adding to docker group
+
+  - name: Adding current user to Docker group
+    user:
+      name: ubuntu
+      append: yes
+      groups: docker
+
+  - name: Installing docker module
+    pip:
+      name: docker
+
+  - name: "Installing docker-compose"
+    pip:
+      name: docker-compose
+      state: present
+
+###################### Getting Git repository  ############################
+  - name: Git clone project
+    become_user: ubuntu
     git:
-      repo: "https://github.com/cloudacademy/static-website-example"
-      dest: "/opt/static-website-example"
-      force: yes
+      repo: "https://github.com/hafizpatwary/microservices.git"
+      dest: ~/microservices
+      version: database
+      update: no
+
+  - name: Run `docker-compose up` again
+    docker_compose:
+      project_src: microservices
+      build: yes
+      state: present
+
+# Create AMI of the instance
+
+- hosts: localhost
+  connection: local
+  tasks:
+
+  - ec2_ami:
+      instance_id: "{{ item }}"
+      wait: yes
+      name: application
+      state: present
+      tags:
+        Name: application
+        Service: TestService
+    with_items: "{{ ec2_instance_id }}"
+
+  - ec2_instance_info:
+      instance_ids: "{{ output['cloudformation']['test-stack']['stack_resource_list'] | json_query(query) }}"
+    vars:
+      query: "[?ResourceType=='AWS::EC2::Instance'].PhysicalResourceId"
+    register: ec2
+  - debug:
+      msg: "{{ ec2 }}"
+
+  - name: gather information about all AMIs with tag key Name and value webapp
+    ec2_ami_info:
+      filters:
+        "tag:Name": application
+    register: ami
+  - debug:
+      msg: "{{ ami }}"
+
+
+  # - ec2_lc:
+  #     name: special
+  #     instance_id: "{{ item }}"
+  #     key_name: CloudFormationKeyPair
+  #     security_groups: ['launch-wizard-1']
+  #     state: present
+  #     volumes:
+  #     - device_name: /dev/sda1
+  #       volume_size: 8
+  #       volume_type: gp2
+  #       delete_on_termination: true
+  #   with_items: "{{ ec2_instance_id }}"
+
+
+
+
